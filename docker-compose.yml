@@ -1,0 +1,19 @@
+services:
+  hl2dm:
+    image: svk2907/hl2dm-server-2026-10-v1:latest
+    container_name: hl2dm-server
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 15s
+    ports:
+      - "27015:27015/udp"
+      - "27015:27015/tcp"
+      - "27005:27005/udp"
+    volumes:
+      - hl2dm_data:/home/steam/hl2dm_server
+    environment:
+      SRCDS_VALIDATE: "0"
+      # SRCDS_APP_UPDATE: "0"   # no network, fastest start
+
+volumes:
+  hl2dm_data:
