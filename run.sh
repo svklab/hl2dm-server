@@ -1,6 +1,6 @@
 #!/bin/sh
 # =============================================================================
-#  HL2DM dedicated server - startup script (v1)
+#  HL2DM dedicated server - startup script (v1-latest)
 #
 #  Game content is NOT baked into the image. On first start SteamCMD fetches
 #  app 232370 into $HL2DM_INSTALL_DIR, which is expected to be a mounted
@@ -17,9 +17,10 @@
 #    2. The defaults baked into /opt/hl2dm-defaults
 #
 #  Startup phases, as printed in `docker logs`:
-#    1/2  SteamCMD updates itself. Its bootstrap ships inside the image, so a
-#         fresh container pulls ~41 MB here before anything else - this is the
-#         download people mistake for the game content.
+#    1/2  SteamCMD self-update check. The full self-update was baked into the
+#         image at build time, so on a fresh container this is a quick version
+#         check that downloads at most a delta - not the old ~41 MB every-
+#         container fetch.
 #    2/2  The game content is fetched/checked: ~895 MB on a first install, a
 #         manifest check of a few seconds afterwards.
 #  Both are limited by Steam's CDN rather than by this image; observed speeds
@@ -69,13 +70,79 @@ set_convar() {
     mv -f "$_t" "$_f"
 }
 
+# ------------------------------------------------------------ PID bookkeeping
+# Track the child of each phase so a stop-signal that arrives mid-download can
+# terminate exactly that process (and its tree) instead of killing PID 1.
+srv_pid=""
+steamcmd_pid=""
+
+# Kill the server tree outright - used only when the graceful quit timed out.
+force_stop() {
+    kill -TERM "$srv_pid" 2>/dev/null || true
+    for c in /proc/[0-9]*/comm; do
+        [ -r "$c" ] || continue
+        case "$(cat "$c" 2>/dev/null || true)" in
+            srcds_run|srcds_linux) ;;
+            *) continue ;;
+        esac
+        p="${c#/proc/}"; p="${p%/comm}"
+        kill -TERM "$p" 2>/dev/null || true
+    done
+    sleep 2
+    kill -KILL "$srv_pid" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------ shutdown
+# The trap is installed BEFORE the download phases so that `docker stop` is
+# honoured while steamcmd is still fetching content, not just once the server
+# is up: either the steamcmd child is terminated, or the graceful console 'quit'
+# path runs. (In the old image a stop during phase 1/2 killed PID 1 outright.)
+shutdown() {
+    if [ -z "$srv_pid" ]; then
+        # Still in a download/install phase: terminate the active steamcmd child.
+        trap '' INT TERM
+        log "stop requested during initialization - terminating steamcmd"
+        if [ -n "$steamcmd_pid" ]; then
+            kill -TERM "$steamcmd_pid" 2>/dev/null || true
+            wait "$steamcmd_pid" 2>/dev/null || true
+        fi
+        rm -f "${STEAM_HOME}/.srcds-console.fifo" 2>/dev/null || true
+        exit 130
+    fi
+
+    trap '' INT TERM            # ignore any further stop signals
+    log "stop requested - asking the server to quit"
+    printf 'quit\n' >&3 2>/dev/null || true
+
+    waited=0
+    while [ "$waited" -lt "${SRCDS_STOP_TIMEOUT:-8}" ]; do
+        kill -0 "$srv_pid" 2>/dev/null || break
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if kill -0 "$srv_pid" 2>/dev/null; then
+        log "server did not quit within ${SRCDS_STOP_TIMEOUT:-8}s - terminating it"
+        force_stop
+    fi
+
+    # Reap the server's real exit status (the interrupted `wait` did not) and
+    # stop the entrypoint from here so the container exit code reflects it.
+    rc=0
+    if wait "$srv_pid" 2>/dev/null; then rc=0; else rc=$?; fi
+    rm -f "${STEAM_HOME}/.srcds-console.fifo" 2>/dev/null || true
+    log "server exited with code ${rc}"
+    exit "$rc"
+}
+trap shutdown INT TERM
+
 # ------------------------------------------------------------ 1. fetch content
 # SteamCMD is run in two explicit phases so the log says plainly what is being
 # downloaded:
-#   phase 1 - SteamCMD updates itself. The bootstrap baked into the image comes
-#             from Valve's tarball, so on every fresh container SteamCMD first
-#             replaces itself (~41 MB) before it can do anything else. This is
-#             the download on a first start that reads as "the game is huge".
+#   phase 1 - SteamCMD self-update check. The full self-update done here was
+#             baked into the image at build time; on a fresh container this is
+#             a quick version check (delta download at most) instead of the old
+#             ~41 MB per-container fetch.
 #   phase 2 - the game content: ~895 MB on a first install, a few seconds of
 #             manifest checking afterwards.
 # Splitting them also warms the appinfo cache, which avoids the one-off
@@ -98,6 +165,7 @@ run_steamcmd() {
     _attempt=1
     while : ; do
         "$STEAMCMD_DIR/steamcmd.sh" "$@" &
+        steamcmd_pid=$!
         _pid=$!
 
         _ticks=0
@@ -110,9 +178,11 @@ run_steamcmd() {
         done
 
         if wait "$_pid"; then
+            steamcmd_pid=""
             return 0
         fi
 
+        steamcmd_pid=""
         _attempt=$((_attempt + 1))
         if [ "$_attempt" -gt "$max_attempts" ]; then
             die "SteamCMD failed during ${_label} after ${max_attempts} attempts"
@@ -129,7 +199,7 @@ if [ "${SRCDS_APP_UPDATE:-1}" = "1" ]; then
         log "no game content found - phase 2 downloads ~895 MB, be patient"
     fi
 
-    log "SteamCMD 1/2: self-update (up to ~41 MB, happens once per container)"
+    log "SteamCMD 1/2: self-update check (baked into image at build time)"
     run_steamcmd "SteamCMD self-update" +login anonymous +quit
 
     if [ "${SRCDS_VALIDATE:-0}" = "1" ]; then
@@ -265,50 +335,6 @@ SRCDS_CMD="stty -onlcr 2>/dev/null || true; exec ./srcds_run -game hl2mp -consol
 +ip ${SRCDS_IP} +hostport ${SRCDS_PORT} +clientport ${SRCDS_CLIENT_PORT} \
 +motdfile motd.txt +exec server.cfg +mapcyclefile cfg/mapcycle.txt \
 +map ${SRCDS_MAP} +mp_teamplay 0 ${SRCDS_EXTRA_ARGS:-}"
-
-# Kill the server tree outright - used only when the graceful quit timed out.
-force_stop() {
-    kill -TERM "$srv_pid" 2>/dev/null || true
-    for c in /proc/[0-9]*/comm; do
-        [ -r "$c" ] || continue
-        case "$(cat "$c" 2>/dev/null || true)" in
-            srcds_run|srcds_linux) ;;
-            *) continue ;;
-        esac
-        p="${c#/proc/}"; p="${p%/comm}"
-        kill -TERM "$p" 2>/dev/null || true
-    done
-    sleep 2
-    kill -KILL "$srv_pid" 2>/dev/null || true
-}
-
-shutdown() {
-    [ -n "$srv_pid" ] || return 0
-    trap '' INT TERM            # ignore any further stop signals
-    log "stop requested - asking the server to quit"
-    printf 'quit\n' >&3 2>/dev/null || true
-
-    waited=0
-    while [ "$waited" -lt "${SRCDS_STOP_TIMEOUT:-8}" ]; do
-        kill -0 "$srv_pid" 2>/dev/null || break
-        sleep 1
-        waited=$((waited + 1))
-    done
-
-    if kill -0 "$srv_pid" 2>/dev/null; then
-        log "server did not quit within ${SRCDS_STOP_TIMEOUT:-8}s - terminating it"
-        force_stop
-    fi
-
-    # Reap the server's real exit status (the interrupted `wait` did not) and
-    # stop the entrypoint from here so the container exit code reflects it.
-    rc=0
-    if wait "$srv_pid" 2>/dev/null; then rc=0; else rc=$?; fi
-    rm -f "$CONSOLE_FIFO" 2>/dev/null || true
-    log "server exited with code ${rc}"
-    exit "$rc"
-}
-trap shutdown INT TERM
 
 srv_pid=""
 if command -v script >/dev/null 2>&1; then

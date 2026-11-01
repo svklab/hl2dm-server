@@ -1,0 +1,6 @@
+# Build context for the HL2DM image contains only what the image needs.
+.git
+.gitignore
+*.md
+docker-compose.yml
+feasibility.Dockerfile

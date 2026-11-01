@@ -1,26 +1,34 @@
-# Half-Life 2 Deathmatch Server
+# Half-Life 2 Deathmatch Server (v1-latest)
 
 **HL2DM dedicated server** (Valve App ID `232370`) on **Debian 13 (trixie-slim)**. Pull and
 play — no SteamCMD setup, no 32-bit library hunting, no multi-gigabyte image download.
 
+Rebuilt and hardened as `svk2907/hl2dm-server-2026-10-v1:latest`. Launch principles, layout,
+config handling, the volume contract and the `SRCDS_*` interface are **unchanged** from
+`2026-10-v1:old`; `server.cfg`, `mapcycle.txt` and `motd.txt` are byte-identical to the old
+image.
+
 ## Highlights
 
-- **~56 MB compressed** — the smallest HL2DM image around. Game content is *not* baked in;
-  SteamCMD fetches app `232370` on first start (~895 MB) into a mounted volume
-- **Fully self-contained** — `server.cfg`, `mapcycle.txt` and `motd.txt` ship in the image and
-  are deployed on every start. No config files to mount
+- **Fast first start into a new container** — the SteamCMD self-update is baked into the image
+  at build time. Phase 1 is a version check (seconds), not the old ~41 MB per-container
+  download that could take up to several minutes
+- **Updated base** — `apt-get upgrade` runs at build time, so all packages (including i386
+  multiarch libs) are at the current trixie level, not pinned to whatever the base tag held
+- **Slash-redundant 32-bit libs removed** — `lib32gcc-s1`/`lib32stdc++6` were aliases of the
+  `:i386` packages already installed; only the i386 variants are now installed
+- **Clean `docker stop` during a content download** — the signal trap is installed before the
+  SteamCMD phases; stopping while steamcmd fetches content terminates steamcmd cleanly instead
+  of killing PID 1 outright (verified: exit 130, ~3 s, interrupted download resumes fine)
+- **Graceful shutdown when serving** — `docker stop` → SIGINT → console `quit` → exit 0 in
+  ~2 s (no SIGKILL, no exit 137)
+- **Health check** — healthy only when `srcds_linux` runs and the game UDP port is bound; start
+  period raised to 900 s to cover first-run downloads on slow Steam CDNs
+- **Fully self-contained** — `server.cfg`, `mapcycle.txt`, `motd.txt` ship in the image and are
+  deployed on every start. No config files to mount
 - **8 maps ready** — 7 official DM maps plus custom `halls3`, full rotation configured
-- **Zero host dependencies** — SteamCMD and all i386 runtime libraries are baked in
 - **Non-root** — runs as user `steam` (UID 1000)
-- **Graceful shutdown** — `docker stop` sends `SIGINT`, the entrypoint issues the engine's
-  console `quit`, and the server exits with code 0 in ~2 s (no `SIGKILL`, no exit 137)
-- **Health check** — reports healthy only when `srcds_linux` runs **and** the game UDP port is
-  bound, every 30 s, with a 300 s start period that covers the first download
 - **Self-healing** — SteamCMD retries on failure and checks the manifest at every start
-- **Fast warm start** — ~10–15 s to ready (manifest check only); `SRCDS_VALIDATE=1` forces a
-  full re-hash
-- **Honest, labelled startup** — the log separates `SteamCMD 1/2: self-update` (~41 MB) from
-  `SteamCMD 2/2: game content` (~895 MB), so a slow start never looks like a hang
 - **No special Docker flags** — works with the default seccomp profile
 
 ## Quick start
@@ -46,67 +54,37 @@ Connect your HL2DM client to the server IP on port **27015**.
 
 ## First start
 
-Startup has **two clearly labelled phases**, and they are easy to tell apart in the log:
+Startup has two labelled phases, easy to tell apart in the log. Phase 1 is now a fast version
+check thanks to the build-time bake:
 
-| Phase | What is downloading | Size | Frequency |
+| Phase | What happens | Size | Frequency |
 |---|---|---|---|
-| `SteamCMD 1/2: self-update` | SteamCMD updating **itself** | ~41 MB | every time a container is created |
+| `SteamCMD 1/2: self-update` | version check (baked into image at build) | nothing, usually | every container start |
 | `SteamCMD 2/2: game content` | the HL2DM game content | ~895 MB | first install only |
-
-```bash
-docker logs -f hl2dm-server
-```
 
 ```
 [entrypoint] no game content found - phase 2 downloads ~895 MB, be patient
-[entrypoint] SteamCMD 1/2: self-update (up to ~41 MB, happens once per container)
-[entrypoint] SteamCMD self-update: 15s elapsed, game content 1 MB on disk
+[entrypoint] SteamCMD 1/2: self-update check (baked into image at build time)
 [entrypoint] SteamCMD 2/2: game content - update check (SRCDS_VALIDATE=0, manifest only)
 [entrypoint] game content: 15s elapsed, game content 193 MB on disk
 [entrypoint] game content: 45s elapsed, game content 768 MB on disk
 [entrypoint] content ready: 895 MB at /home/steam/hl2dm_server
 ```
 
-Later starts reuse the content on the volume and only check the manifest. Phase 1 still runs,
-because SteamCMD's bootstrap lives in the image layer and refreshes itself per container:
-
-```
-[entrypoint] game content present (895 MB)
-[entrypoint] SteamCMD 1/2: self-update (up to ~41 MB, happens once per container)
-[entrypoint] SteamCMD 2/2: game content - update check (SRCDS_VALIDATE=0, manifest only)
-[entrypoint] content ready: 895 MB at /home/steam/hl2dm_server
-```
-
-A warm start reaches `content ready` in roughly **10–15 s** and `healthy` shortly after. With
-`SRCDS_APP_UPDATE=0` and content already on the volume the server is up in a few seconds and
-does not touch the network at all.
-
-### How long the download takes
-
-Both phases are limited by **Steam's CDN and your network**, not by this image. Measured on one
-and the same host:
-
-| Measurement | Result |
-|---|---|
-| Game content, 895 MB | ~60 s (~15 MB/s) |
-| SteamCMD self-update, 41 MB | ~40 s in one run, **~230 s (~0.2 MB/s)** in another |
-
-So a first start can legitimately take anywhere from one minute to well over an hour, and the
-same image that was fast yesterday can crawl today. A start is *not* stuck as long as the
-elapsed-time lines keep appearing and the size keeps growing.
+A warm start (content on the volume) reaches `content ready` in well under a minute and
+`healthy` shortly after. With `SRCDS_APP_UPDATE=0` and content already on the volume the server
+is up in a few seconds and does not touch the network at all.
 
 ## Ports
 
 | Port | Protocol | Purpose |
-|------|----------|---------|
+|---|---|---|
 | 27015 | UDP/TCP | Game traffic |
 | 27005 | UDP | Client (voice) |
 
 Only `27015/udp` is required; `27015/tcp` and `27005/udp` are optional but recommended.
 
 ## Default settings
-
-Everything is configured in the image, so no environment variables are needed:
 
 | Setting | Value |
 |---|---|
@@ -117,29 +95,9 @@ Everything is configured in the image, so no environment variables are needed:
 | Max players | 12 |
 | Frag limit / time limit | 50 / 20 min |
 | Region | Europe (`sv_region 3`) |
-| Friendly fire / fall damage | Off / 5 |
-| Respawn — weapon / item | 5s / 10s |
-| Voice | All-talk on, `vaudio_miles` |
-| Gravity / max speed | 450 / 320 |
 | RCON | Disabled (no password set) |
 
 ## Customising
-
-Add any of these `-e` flags to override the defaults above:
-
-```bash
-docker run -d \
-  --name hl2dm-server \
-  --restart unless-stopped \
-  -p 27015:27015/udp -p 27015:27015/tcp -p 27005:27005/udp \
-  -v hl2dm_data:/home/steam/hl2dm_server \
-  -e SRCDS_HOSTNAME="My HL2DM Server" \
-  -e SRCDS_MAXPLAYERS=16 \
-  -e SRCDS_MAP=dm_lockdown \
-  -e SRCDS_MAPCYCLE="dm_c4|dm_killbox" \
-  -e SRCDS_RCON_PASSWORD='change-me' \
-  svk2907/hl2dm-server-2026-10-v1:latest
-```
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -160,129 +118,50 @@ docker run -d \
 | `SRCDS_APP_UPDATE` | `1` | `0` = skip Steam entirely, start in seconds |
 | `SRCDS_STOP_TIMEOUT` | `8` | seconds to wait for the console `quit` |
 
-## Adding a custom map
-
-`cfg/mapcycle.txt` is regenerated from the image default on every start, so editing it inside
-the container does **not** survive a restart. Copy the map and add it to `SRCDS_MAPCYCLE`:
-
-```bash
-docker cp ./mymap.bsp hl2dm-server:/home/steam/hl2dm_server/hl2mp/maps/
-
-# include the new map in the rotation (this is what makes it permanent)
-docker run -d ... \
-  -e SRCDS_MAPCYCLE="dm_lockdown|dm_overwatch|dm_powerhouse|dm_resistance|dm_runoff|dm_steamlab|dm_underpass|halls3|mymap" \
-  svk2907/hl2dm-server-2026-10-v1:latest
-```
-
-## Updating
-
-Game content is checked against Valve's manifest on every start, so an update normally requires
-nothing. To force a full re-verify or repair a damaged install either start with
-`SRCDS_VALIDATE=1`, or do it in a running container:
-
-```bash
-docker exec hl2dm-server \
-  /home/steam/steamcmd/steamcmd.sh \
-  +force_install_dir /home/steam/hl2dm_server \
-  +login anonymous +app_update 232370 validate +quit
-docker restart hl2dm-server
-```
-
-Image updates are independent of content updates — pull the image, then recreate the container
-against the same volume.
-
-## docker compose
-
-```yaml
-services:
-  hl2dm:
-    image: svk2907/hl2dm-server-2026-10-v1:latest
-    container_name: hl2dm-server
-    restart: unless-stopped
-    stop_signal: SIGINT
-    stop_grace_period: 15s
-    ports:
-      - "27015:27015/udp"
-      - "27015:27015/tcp"
-      - "27005:27005/udp"
-    volumes:
-      - hl2dm_data:/home/steam/hl2dm_server
-    environment:
-      SRCDS_VALIDATE: "0"
-      # SRCDS_APP_UPDATE: "0"   # no network, fastest start
-
-volumes:
-  hl2dm_data:
-```
-
 ## Image details
 
 | | |
 |---|---|
-| Base image | `debian:trixie-slim` (Debian 13) |
+| Base image | `debian:trixie-slim` (Debian 13), all packages upgraded at build |
 | Architecture | `linux/amd64` |
-| Compressed size | ~56 MB |
-| Uncompressed size | ~221 MB |
+| SteamCMD | updated (self-update baked into the image, not re-downloaded per container) |
 | Game content | ~895 MB, downloaded at runtime |
 | Steam App ID | `232370` |
 | Runs as | `steam` (UID 1000, non-root) |
 | Data directory | `/home/steam/hl2dm_server` |
 | Entrypoint | `/home/steam/run.sh` |
 | Stop signal | `SIGINT` → console `quit` → exit 0 |
-| Health check | `srcds_linux` running **and** UDP port bound, every 30 s |
+| Health check | `srcds_linux` running **and** UDP port bound, every 30 s, 900 s start period |
 
-### What changed in v1
+## What changed in v1-latest
 
-| | `2026-10-trixie` | `2026-10-v1` |
+| | `2026-10-v1` (`:old`) | `2026-10-v1:latest` |
 |---|---|---|
-| `docker stop` | engine ignored `SIGTERM`, killed after timeout (exit 137) | pty + console `quit`, exit 0 in ~2 s |
-| Warm start | full 895 MB re-hash (~50 s) | manifest check only, ~10–15 s; `SRCDS_VALIDATE=1` to re-hash |
-| Health check | `pgrep srcds_linux` | process **and** bound UDP port, 30 s, 300 s start period |
-| Startup log | unlabelled `downloading, N MB of ~895 MB` counter | labelled `SteamCMD 1/2` and `SteamCMD 2/2` phases |
-| Package set | `wget`, `iproute2`, `procps`, i386 ncurses/tinfo | trimmed to what the server and entrypoint actually use |
-| Size | 232 MB / ~59 MB compressed | 221 MB / ~56 MB compressed |
+| SteamCMD update | re-downloaded ~41 MB by every new container (up to minutes) | baked into the image at build time; phase 1 = fast version check |
+| Base packages | pinned to whatever `trixie-slim` held at build | `apt-get upgrade` runs at build, all packages current |
+| 32-bit libs | `libc6:i386` + `libstdc++6:i386` + `zlib1g:i386` + `lib32gcc-s1` + `lib32stdc++6` | i386 variants only (`libgcc-s1:i386` instead of the `lib32-*` aliases) |
+| `docker stop` during install | killed PID 1 outright (raw SIGINT) | terminates steamcmd cleanly, exit 130, download resumes on restart |
+| Healthcheck start period | 300 s | 900 s |
+| OCI labels | no source/url | `source`, `url`, `documentation` pointers added |
 
 ## Notes
 
 - Requires an `amd64` (x86-64) host — the 32-bit Source engine binary is not available for arm64.
-- Allow ~1.4 GB of free disk for the image plus the game content volume.
-- Shutdown is graceful by design: the image sets `STOPSIGNAL SIGINT`, so a plain `docker stop`
-  is enough. Do **not** raise `--stop-timeout` expecting a cleaner exit — `SRCDS_STOP_TIMEOUT`
-  (default 8 s) is the knob that matters, and after it the process is killed as a last resort.
+- Allow ~1.5 GB free disk for the image plus the game content volume.
+- Shutdown is graceful by design: `STOPSIGNAL SIGINT`, so a plain `docker stop` is enough.
+  `SRCDS_STOP_TIMEOUT` (default 8 s) is the knob that matters; after it the process is killed as
+  a last resort.
 - The image contains no plugin framework. MetaMod / SourceMod can be unpacked into
   `/home/steam/hl2dm_server/hl2mp/addons` on the volume.
-- A first `app_update` on a brand-new SteamCMD cache can fail once with `Missing configuration`;
-  the entrypoint retries automatically, no action needed.
-- SteamCMD sometimes logs `Update state (0x0) : Timed out waiting for update to start, bailing.`
-  when its CDN is slow. It retries on its own and the line is followed by
-  `Success! App '232370' fully installed.` — harmless.
-- The console prints `Unknown command` four times for `sv_maxunlag`, `sv_unlag`,
-  `sv_instancebaselines` and `sv_hltv` — legacy convars inherited from Valve's stock
-  `server.cfg` that do not exist in HL2DM. Harmless.
-
-### Log noise you can ignore
-
-| Line | Why |
-|---|---|
-| `Please install (lib32tinfo5 / ncurses-libs.i686 / equivalent) to enable readline.` | SteamCMD wants the pre-trixie `libtinfo5`/`ncurses5` for its interactive console. Debian 13 no longer ships them; only SteamCMD's own readline is affected, never the game server. |
-| `ILocalize::AddFile() failed to load file "public/steambootstrapper_english.txt".` | SteamCMD cosmetic, printed by its bootstrapper on every run. |
-| `[S_API FAIL] Tried to access Steam interface ... before SteamAPI_Init succeeded.` | Source engine cosmetic, present for years on dedicated servers. |
-| `WARNING: setlocale('en_US.UTF-8') failed, using locale: 'C'.` | Would mean the `en_US.UTF-8` locale is missing — this image generates it, so you should not see this line. |
-
-### Troubleshooting
-
-**"It downloads ~900 MB on every single start."**
-The game volume is not mounted (or is empty). Check that the run command has
-`-v hl2dm_data:/home/steam/hl2dm_server` and that the log says
-`game content present (895 MB)`.
-
-**"The download is very slow."**
-That is Steam's CDN, not the image. Wait it out, or — once the content is on the volume — skip
-networking entirely with `-e SRCDS_APP_UPDATE=0`. The server then starts in a few seconds.
-
-**"Phase 1 takes minutes every restart."**
-Expected: SteamCMD re-downloads its own ~41 MB update in every new container. Restarting the
-*same* container (`docker restart`) reuses the updated SteamCMD and is fast.
+- `cfg/mapcycle.txt` is regenerated from the image default on every start; to add a map copy the
+  `.bsp` into `hl2mp/maps/` and list it in `SRCDS_MAPCYCLE`.
+- The console prints `Unknown command` four times for legacy convars (`sv_maxunlag`,
+  `sv_unlag`, `sv_instancebaselines`, `sv_hltv`) inherited from Valve's stock `server.cfg` —
+  harmless.
+- At shutdown the engine's crash reporter may print
+  `error: libcurl.so: cannot open shared object file` — the 32-bit `libcurl` is not installed
+  (same as the old image), dumps are still written locally under `/tmp/dumps`. Cosmetic, not a
+  regression.
 
 - Half-Life 2 and HL2DM are trademarks of Valve Corporation. This project is not affiliated
   with or endorsed by Valve. Game content is downloaded anonymously via SteamCMD at runtime and

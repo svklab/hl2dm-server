@@ -1,8 +1,14 @@
 services:
   hl2dm:
+    build:
+      context: .
+      args:
+        VERSION: "2026-10-v1"
     image: svk2907/hl2dm-server-2026-10-v1:latest
     container_name: hl2dm-server
     restart: unless-stopped
+    # The entrypoint sets STOPSIGNAL SIGINT; repeat it here so the behaviour
+    # survives anyone overriding the image default.
     stop_signal: SIGINT
     stop_grace_period: 15s
     ports:
@@ -12,8 +18,14 @@ services:
     volumes:
       - hl2dm_data:/home/steam/hl2dm_server
     environment:
+      SRCDS_HOSTNAME: "HL2DM Server -- Happy gaming"
+      SRCDS_MAXPLAYERS: "12"
+      SRCDS_MAP: "dm_overwatch"
+      # 0 = fast start (manifest check only); set to 1 to re-hash all content.
       SRCDS_VALIDATE: "0"
-      # SRCDS_APP_UPDATE: "0"   # no network, fastest start
+      # Uncomment to skip SteamCMD entirely: no network, starts in a few seconds.
+      # Trade-off: the server will not pick up game updates by itself.
+      # SRCDS_APP_UPDATE: "0"
 
 volumes:
   hl2dm_data:
