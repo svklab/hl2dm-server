@@ -2,13 +2,18 @@ services:
   hl2dm:
     build:
       context: .
+      pull: true
       args:
-        VERSION: "2026-10-v1"
-    image: svk2907/hl2dm-server-2026-10-v1:latest
+        VERSION: "2026-v1.0"
+        REVISION: "${REVISION:-unknown}"
+        CREATED: "${CREATED:-1970-01-01T00:00:00Z}"
+    image: svk2907/hl2dm-server-2026-v1.0:latest
+    platform: linux/amd64
     container_name: hl2dm-server
     restart: unless-stopped
     # The entrypoint sets STOPSIGNAL SIGINT; repeat it here so the behaviour
-    # survives anyone overriding the image default.
+    # survives anyone overriding the image default. 15 s leaves room for the
+    # console 'quit' plus the forced-stop fallback.
     stop_signal: SIGINT
     stop_grace_period: 15s
     ports:
@@ -26,6 +31,9 @@ services:
       # Uncomment to skip SteamCMD entirely: no network, starts in a few seconds.
       # Trade-off: the server will not pick up game updates by itself.
       # SRCDS_APP_UPDATE: "0"
+    # Hardening: the server never needs to gain privileges.
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   hl2dm_data:

@@ -1,6 +1,6 @@
 #!/bin/sh
 # =============================================================================
-#  HL2DM dedicated server - startup script (v1-latest)
+#  HL2DM dedicated server - startup script (v1.0)
 #
 #  Game content is NOT baked into the image. On first start SteamCMD fetches
 #  app 232370 into $HL2DM_INSTALL_DIR, which is expected to be a mounted
@@ -19,8 +19,7 @@
 #  Startup phases, as printed in `docker logs`:
 #    1/2  SteamCMD self-update check. The full self-update was baked into the
 #         image at build time, so on a fresh container this is a quick version
-#         check that downloads at most a delta - not the old ~41 MB every-
-#         container fetch.
+#         check that downloads at most a delta.
 #    2/2  The game content is fetched/checked: ~895 MB on a first install, a
 #         manifest check of a few seconds afterwards.
 #  Both are limited by Steam's CDN rather than by this image; observed speeds
@@ -36,25 +35,124 @@
 # =============================================================================
 set -eu
 
-export STEAM_HOME
+STEAM_HOME="${STEAM_HOME:-/home/steam}"
+STEAMCMD_DIR="${STEAMCMD_DIR:-/home/steam/steamcmd}"
+HL2DM_INSTALL_DIR="${HL2DM_INSTALL_DIR:-/home/steam/hl2dm_server}"
+HL2DM_DEFAULT_DIR="${HL2DM_DEFAULT_DIR:-/opt/hl2dm-defaults}"
+SRCDS_APP_ID="${SRCDS_APP_ID:-232370}"
+
 export HOME="${STEAM_HOME}"
 export LD_LIBRARY_PATH="${HL2DM_INSTALL_DIR}/bin:/usr/lib/i386-linux-gnu:${LD_LIBRARY_PATH:-}"
 
-DEFAULT_DIR="${HL2DM_DEFAULT_DIR:-/opt/hl2dm-defaults}"
+DEFAULT_DIR="${HL2DM_DEFAULT_DIR}"
 STATE_FILE="${STEAM_HOME}/.hl2dm-state"
+CONSOLE_FIFO="${STEAM_HOME}/.srcds-console.fifo"
 
 # ------------------------------------------------------------------ logging
 log() { printf '[entrypoint] %s\n' "$*"; }
+warn() { printf '[entrypoint] WARNING: %s\n' "$*" >&2; }
 die() { printf '[entrypoint] FATAL: %s\n' "$*" >&2; exit 1; }
 
 # The health probe reads this to tell "busy installing" from "should be serving".
-# It lives outside the image so it works for any user/volume layout.
 set_state() { printf '%s\n' "$1" > "$STATE_FILE"; }
 
 set_state installing
 
+# --------------------------------------------------------------- validation
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    return 0
+}
+
+# check_uint <name> <value> <min> <max>
+check_uint() {
+    _name="$1"; _value="$2"; _min="$3"; _max="$4"
+    is_uint "$_value" || die "${_name} must be a number, got '${_value}'"
+    [ "$_value" -ge "$_min" ] && [ "$_value" -le "$_max" ] \
+        || die "${_name} must be between ${_min} and ${_max}, got '${_value}'"
+}
+
+# A newline in a quoted cvar value would end the quoted string and could inject
+# another convar into server.cfg. Passwords, hostnames and other quoted values
+# are therefore rejected if they span more than one line.
+check_no_newline() {
+    _name="$1"; _value="$2"
+    case "$_value" in
+        *"
+"*) die "${_name} must not contain a newline" ;;
+    esac
+}
+
+SRCDS_PORT="${SRCDS_PORT:-27015}"
+SRCDS_CLIENT_PORT="${SRCDS_CLIENT_PORT:-27005}"
+SRCDS_MAXPLAYERS="${SRCDS_MAXPLAYERS:-12}"
+SRCDS_TICKRATE="${SRCDS_TICKRATE:-66}"
+SRCDS_REGION="${SRCDS_REGION:-3}"
+SRCDS_MAP="${SRCDS_MAP:-dm_overwatch}"
+SRCDS_IP="${SRCDS_IP:-0.0.0.0}"
+SRCDS_STOP_TIMEOUT="${SRCDS_STOP_TIMEOUT:-8}"
+
+check_uint SRCDS_PORT "$SRCDS_PORT" 1 65535
+check_uint SRCDS_CLIENT_PORT "$SRCDS_CLIENT_PORT" 1 65535
+check_uint SRCDS_MAXPLAYERS "$SRCDS_MAXPLAYERS" 1 64
+check_uint SRCDS_TICKRATE "$SRCDS_TICKRATE" 10 1000
+check_uint SRCDS_REGION "$SRCDS_REGION" 0 255
+check_uint SRCDS_STOP_TIMEOUT "$SRCDS_STOP_TIMEOUT" 1 300
+
+[ -n "$SRCDS_MAP" ] || die "SRCDS_MAP must not be empty"
+[ -n "$SRCDS_IP" ] || die "SRCDS_IP must not be empty"
+
+case "${SRCDS_APP_UPDATE:-1}" in
+    0|1) ;;
+    *) die "SRCDS_APP_UPDATE must be 0 or 1, got '${SRCDS_APP_UPDATE}'" ;;
+esac
+case "${SRCDS_VALIDATE:-0}" in
+    0|1) ;;
+    *) die "SRCDS_VALIDATE must be 0 or 1, got '${SRCDS_VALIDATE}'" ;;
+esac
+
+# Reject multi-line quoted values before the (potentially long) content
+# download, not after it.
+[ -z "${SRCDS_HOSTNAME:-}" ] || check_no_newline SRCDS_HOSTNAME "$SRCDS_HOSTNAME"
+[ -z "${SRCDS_PASSWORD:-}" ] || check_no_newline SRCDS_PASSWORD "$SRCDS_PASSWORD"
+[ -z "${SRCDS_RCON_PASSWORD:-}" ] || check_no_newline SRCDS_RCON_PASSWORD "$SRCDS_RCON_PASSWORD"
+
+# ------------------------------------------------------------ filesystem checks
+# A bind-mounted host directory is owned by the host UID, not by the image's
+# steam user. Fail early with an actionable message instead of letting SteamCMD
+# or the engine produce a confusing "permission denied" later.
+[ -r "$DEFAULT_DIR/server.cfg" ] || die "default server.cfg not found in ${DEFAULT_DIR}"
+[ -r "$DEFAULT_DIR/mapcycle.txt" ] || die "default mapcycle.txt not found in ${DEFAULT_DIR}"
+[ -r "$DEFAULT_DIR/motd.txt" ] || die "default motd.txt not found in ${DEFAULT_DIR}"
+
+if [ ! -d "$HL2DM_INSTALL_DIR" ]; then
+    mkdir -p "$HL2DM_INSTALL_DIR" 2>/dev/null \
+        || die "cannot create ${HL2DM_INSTALL_DIR}"
+fi
+[ -w "$HL2DM_INSTALL_DIR" ] \
+    || die "${HL2DM_INSTALL_DIR} is not writable by uid $(id -u). If you bind-mount a host directory, chown it to ${STEAM_UID:-1000}:${STEAM_GID:-1000}."
+
+if [ "${SRCDS_APP_UPDATE:-1}" = "1" ]; then
+    [ -d "$STEAMCMD_DIR" ] || die "SteamCMD directory ${STEAMCMD_DIR} is missing"
+    [ -x "$STEAMCMD_DIR/steamcmd.sh" ] || die "SteamCMD not found at ${STEAMCMD_DIR}/steamcmd.sh"
+    [ -w "$STEAMCMD_DIR" ] \
+        || die "${STEAMCMD_DIR} is not writable by uid $(id -u); SteamCMD needs to update itself."
+else
+    [ -x "$HL2DM_INSTALL_DIR/srcds_run" ] \
+        || die "SRCDS_APP_UPDATE=0 but ${HL2DM_INSTALL_DIR}/srcds_run is missing; remove the variable or mount the volume with game content."
+fi
+
 # Escape a value for safe use as a sed replacement.
 esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+
+# Quote a cvar value for the Source config parser. This keeps a quote or a
+# backslash in a hostname/password from terminating the value early.
+cvar_quote() {
+    _q=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    printf '"%s"' "$_q"
+}
 
 # Replace the value of a convar line, or append the convar if it is absent.
 # $1=file  $2=convar key  $3=new value
@@ -76,78 +174,110 @@ set_convar() {
 srv_pid=""
 steamcmd_pid=""
 
-# Kill the server tree outright - used only when the graceful quit timed out.
-force_stop() {
-    kill -TERM "$srv_pid" 2>/dev/null || true
-    for c in /proc/[0-9]*/comm; do
-        [ -r "$c" ] || continue
-        case "$(cat "$c" 2>/dev/null || true)" in
-            srcds_run|srcds_linux) ;;
+# Terminate the active SteamCMD process and any steamcmd/steamerrorreporter
+# children. steamcmd.sh runs the real client as a child, so killing only the
+# shell wrapper can leave the download running.
+kill_steamcmd_tree() {
+    _pid="${1:-}"
+    if [ -n "$_pid" ]; then
+        kill -TERM "$_pid" 2>/dev/null || true
+    fi
+    for _c in /proc/[0-9]*/comm; do
+        [ -r "$_c" ] || continue
+        case "$(cat "$_c" 2>/dev/null || true)" in
+            steamcmd|steamerrorreporter) ;;
             *) continue ;;
         esac
-        p="${c#/proc/}"; p="${p%/comm}"
-        kill -TERM "$p" 2>/dev/null || true
+        _p="${_c#/proc/}"; _p="${_p%/comm}"
+        kill -TERM "$_p" 2>/dev/null || true
+    done
+    sleep 1
+    if [ -n "$_pid" ]; then
+        kill -KILL "$_pid" 2>/dev/null || true
+    fi
+    for _c in /proc/[0-9]*/comm; do
+        [ -r "$_c" ] || continue
+        case "$(cat "$_c" 2>/dev/null || true)" in
+            steamcmd|steamerrorreporter) ;;
+            *) continue
+        esac
+        _p="${_c#/proc/}"; _p="${_p%/comm}"
+        kill -KILL "$_p" 2>/dev/null || true
+    done
+}
+
+# Kill the server tree outright - used only when the graceful quit timed out.
+force_stop() {
+    log "server did not quit in time - terminating it"
+    [ -n "$srv_pid" ] && kill -TERM "$srv_pid" 2>/dev/null || true
+    for _c in /proc/[0-9]*/comm; do
+        [ -r "$_c" ] || continue
+        case "$(cat "$_c" 2>/dev/null || true)" in
+            srcds_run|srcds_linux|script) ;;
+            *) continue ;;
+        esac
+        _p="${_c#/proc/}"; _p="${_p%/comm}"
+        kill -TERM "$_p" 2>/dev/null || true
     done
     sleep 2
-    kill -KILL "$srv_pid" 2>/dev/null || true
+    [ -n "$srv_pid" ] && kill -KILL "$srv_pid" 2>/dev/null || true
+    for _c in /proc/[0-9]*/comm; do
+        [ -r "$_c" ] || continue
+        case "$(cat "$_c" 2>/dev/null || true)" in
+            srcds_run|srcds_linux) ;;
+            *) continue
+        esac
+        _p="${_c#/proc/}"; _p="${_p%/comm}"
+        kill -KILL "$_p" 2>/dev/null || true
+    done
 }
 
 # ------------------------------------------------------------------ shutdown
 # The trap is installed BEFORE the download phases so that `docker stop` is
 # honoured while steamcmd is still fetching content, not just once the server
-# is up: either the steamcmd child is terminated, or the graceful console 'quit'
-# path runs. (In the old image a stop during phase 1/2 killed PID 1 outright.)
+# is up.
 shutdown() {
+    trap '' INT TERM
+
     if [ -z "$srv_pid" ]; then
-        # Still in a download/install phase: terminate the active steamcmd child.
-        trap '' INT TERM
+        # Still in a download/install phase: terminate the active steamcmd tree.
         log "stop requested during initialization - terminating steamcmd"
-        if [ -n "$steamcmd_pid" ]; then
-            kill -TERM "$steamcmd_pid" 2>/dev/null || true
-            wait "$steamcmd_pid" 2>/dev/null || true
-        fi
-        rm -f "${STEAM_HOME}/.srcds-console.fifo" 2>/dev/null || true
+        kill_steamcmd_tree "${steamcmd_pid:-}"
+        rm -f "$CONSOLE_FIFO" 2>/dev/null || true
         exit 130
     fi
 
-    trap '' INT TERM            # ignore any further stop signals
     log "stop requested - asking the server to quit"
     printf 'quit\n' >&3 2>/dev/null || true
 
-    waited=0
-    while [ "$waited" -lt "${SRCDS_STOP_TIMEOUT:-8}" ]; do
+    _waited=0
+    while [ "$_waited" -lt "$SRCDS_STOP_TIMEOUT" ]; do
         kill -0 "$srv_pid" 2>/dev/null || break
         sleep 1
-        waited=$((waited + 1))
+        _waited=$((_waited + 1))
     done
 
     if kill -0 "$srv_pid" 2>/dev/null; then
-        log "server did not quit within ${SRCDS_STOP_TIMEOUT:-8}s - terminating it"
         force_stop
     fi
 
     # Reap the server's real exit status (the interrupted `wait` did not) and
     # stop the entrypoint from here so the container exit code reflects it.
-    rc=0
-    if wait "$srv_pid" 2>/dev/null; then rc=0; else rc=$?; fi
-    rm -f "${STEAM_HOME}/.srcds-console.fifo" 2>/dev/null || true
-    log "server exited with code ${rc}"
-    exit "$rc"
+    _rc=0
+    if wait "$srv_pid" 2>/dev/null; then _rc=0; else _rc=$?; fi
+    rm -f "$CONSOLE_FIFO" 2>/dev/null || true
+    log "server exited with code ${_rc}"
+    exit "$_rc"
 }
 trap shutdown INT TERM
 
 # ------------------------------------------------------------ 1. fetch content
 # SteamCMD is run in two explicit phases so the log says plainly what is being
 # downloaded:
-#   phase 1 - SteamCMD self-update check. The full self-update done here was
-#             baked into the image at build time; on a fresh container this is
-#             a quick version check (delta download at most) instead of the old
-#             ~41 MB per-container fetch.
+#   phase 1 - SteamCMD self-update check (the heavy part is baked into the
+#             image; on a fresh container this is a quick version check);
 #   phase 2 - the game content: ~895 MB on a first install, a few seconds of
 #             manifest checking afterwards.
-# Splitting them also warms the appinfo cache, which avoids the one-off
-#     ERROR! Failed to install app '232370' (Missing configuration)
-# a brand new cache can produce. The retry below stays as a safety net.
 #
 # force_install_dir MUST precede login, otherwise SteamCMD aborts with
 # "Please use force_install_dir before logon!" and downloads nothing.
@@ -223,6 +353,7 @@ fi
 
 GAME_DIR="$HL2DM_INSTALL_DIR/hl2mp"
 [ -x "$HL2DM_INSTALL_DIR/srcds_run" ] || die "$HL2DM_INSTALL_DIR/srcds_run missing"
+[ -d "$GAME_DIR" ] || die "game content is incomplete: ${GAME_DIR} missing"
 mkdir -p "$GAME_DIR/cfg" "$GAME_DIR/logs"
 
 log "content ready: $(du -sm "$HL2DM_INSTALL_DIR" 2>/dev/null | cut -f1) MB at $HL2DM_INSTALL_DIR"
@@ -235,28 +366,28 @@ log "content ready: $(du -sm "$HL2DM_INSTALL_DIR" 2>/dev/null | cut -f1) MB at $
 # too, since some admin tooling looks there.
 cp -f "$DEFAULT_DIR/motd.txt" "$GAME_DIR/motd.txt"
 cp -f "$DEFAULT_DIR/motd.txt" "$GAME_DIR/cfg/motd.txt"
+chmod u+w "$GAME_DIR/motd.txt" "$GAME_DIR/cfg/motd.txt" 2>/dev/null || true
 
 # The hostname default mirrors the value already baked into server.cfg, so a
 # container started with no SRCDS_* env vars deploys a byte-identical
 # server.cfg / mapcycle.txt to the ones shipped in the image.
 SRCDS_HOSTNAME_DEFAULT="HL2DM Server -- Happy gaming"
 
-SRCDS_TICKRATE="${SRCDS_TICKRATE:-66}"
-SRCDS_MAXPLAYERS="${SRCDS_MAXPLAYERS:-12}"
-SRCDS_REGION="${SRCDS_REGION:-3}"
-
 log "generating cfg/server.cfg from image default + environment"
 cp -f "$DEFAULT_DIR/server.cfg" "$GAME_DIR/cfg/server.cfg"
+# The defaults are 0444; the deployed copies must be writable by steam because
+# set_convar and SRCDS_EXTRA_CVARS modify them in place.
+chmod u+w "$GAME_DIR/cfg/server.cfg" 2>/dev/null || true
 
-set_convar "$GAME_DIR/cfg/server.cfg" hostname  "\"${SRCDS_HOSTNAME:-$SRCDS_HOSTNAME_DEFAULT}\""
+set_convar "$GAME_DIR/cfg/server.cfg" hostname "$(cvar_quote "${SRCDS_HOSTNAME:-$SRCDS_HOSTNAME_DEFAULT}")"
 set_convar "$GAME_DIR/cfg/server.cfg" sv_region "$SRCDS_REGION"
 
 # Passwords are absent from the default cfg, so they are appended when set.
 if [ -n "${SRCDS_PASSWORD:-}" ]; then
-    set_convar "$GAME_DIR/cfg/server.cfg" sv_password "\"${SRCDS_PASSWORD}\""
+    set_convar "$GAME_DIR/cfg/server.cfg" sv_password "$(cvar_quote "$SRCDS_PASSWORD")"
 fi
 if [ -n "${SRCDS_RCON_PASSWORD:-}" ]; then
-    set_convar "$GAME_DIR/cfg/server.cfg" rcon_password "\"${SRCDS_RCON_PASSWORD}\""
+    set_convar "$GAME_DIR/cfg/server.cfg" rcon_password "$(cvar_quote "$SRCDS_RCON_PASSWORD")"
 fi
 if [ -n "${SRCDS_EXTRA_CVARS:-}" ]; then
     {
@@ -267,36 +398,55 @@ fi
 
 if [ -n "${SRCDS_MAPCYCLE:-}" ]; then
     log "generating cfg/mapcycle.txt from SRCDS_MAPCYCLE"
+    _mc_tmp="$GAME_DIR/cfg/.mapcycle.txt.tmp"
     {
         printf '// Generated by run.sh from SRCDS_MAPCYCLE ("|" separated)\n'
-        printf '%s' "$SRCDS_MAPCYCLE" | tr '|' '\n'
-    } > "$GAME_DIR/cfg/mapcycle.txt"
+        printf '%s\n' "$SRCDS_MAPCYCLE" | tr '|' '\n'
+    } > "$_mc_tmp"
+    # Atomic replace: the previously deployed mapcycle.txt is 0444, so a plain
+    # ">" redirect would fail with "Permission denied" on the second start.
+    mv -f "$_mc_tmp" "$GAME_DIR/cfg/mapcycle.txt"
 else
     cp -f "$DEFAULT_DIR/mapcycle.txt" "$GAME_DIR/cfg/mapcycle.txt"
+    chmod u+w "$GAME_DIR/cfg/mapcycle.txt" 2>/dev/null || true
 fi
 
 # server.cfg does `exec banned_user.cfg` / `exec banned_ip.cfg`; without the
 # files the console fills with "couldn't exec banned_user.cfg" errors.
-for b in banned_user.cfg banned_ip.cfg; do
-    [ -f "$GAME_DIR/cfg/$b" ] || : > "$GAME_DIR/cfg/$b"
+for _b in banned_user.cfg banned_ip.cfg; do
+    [ -f "$GAME_DIR/cfg/$_b" ] || : > "$GAME_DIR/cfg/$_b"
 done
 
 # SteamCMD ships a crash reporter that the engine looks for next to the game
 # binary. Without it every start logs "Could not find steamerrorreporter binary".
 # Link it in so crash minidumps are actually captured.
 if [ -x "$STEAMCMD_DIR/linux32/steamerrorreporter" ]; then
-    for p in "$HL2DM_INSTALL_DIR/steamerrorreporter" "$HL2DM_INSTALL_DIR/bin/steamerrorreporter"; do
-        [ -e "$p" ] || ln -sf "$STEAMCMD_DIR/linux32/steamerrorreporter" "$p" 2>/dev/null || true
+    for _p in "$HL2DM_INSTALL_DIR/steamerrorreporter" "$HL2DM_INSTALL_DIR/bin/steamerrorreporter"; do
+        [ -e "$_p" ] || ln -sf "$STEAMCMD_DIR/linux32/steamerrorreporter" "$_p" 2>/dev/null || true
     done
 fi
 
+# A missing map is a common mistake after a custom map was removed from the
+# volume (halls3 is a custom map and is not shipped by SteamCMD). Warn instead
+# of failing: the engine may still find a map inside a VPK.
+if [ ! -f "$GAME_DIR/maps/${SRCDS_MAP}.bsp" ]; then
+    warn "starting map ${SRCDS_MAP}.bsp not found in ${GAME_DIR}/maps - the server may fail to start"
+fi
+# The shipped mapcycle.txt is CRLF (Valve's file); strip CR so the names match
+# the .bsp files. A temp file keeps this out of the mapcycle itself.
+_mapcycle_check="$GAME_DIR/cfg/.mapcycle.check"
+tr -d '\r' < "$GAME_DIR/cfg/mapcycle.txt" > "$_mapcycle_check"
+while IFS= read -r _map; do
+    case "$_map" in
+        ''|//*) continue ;;
+    esac
+    [ -f "$GAME_DIR/maps/${_map}.bsp" ] \
+        || warn "map ${_map}.bsp from cfg/mapcycle.txt not found in ${GAME_DIR}/maps - the rotation will skip/fail on it"
+done < "$_mapcycle_check"
+rm -f "$_mapcycle_check"
+
 # ------------------------------------------------------------- 3. run server
 cd "$HL2DM_INSTALL_DIR"
-
-SRCDS_PORT="${SRCDS_PORT:-27015}"
-SRCDS_CLIENT_PORT="${SRCDS_CLIENT_PORT:-27005}"
-SRCDS_MAP="${SRCDS_MAP:-dm_overwatch}"
-SRCDS_IP="${SRCDS_IP:-0.0.0.0}"
 
 log "hostname     : ${SRCDS_HOSTNAME:-$SRCDS_HOSTNAME_DEFAULT}"
 log "map / cycle  : ${SRCDS_MAP} (see cfg/mapcycle.txt)"
@@ -322,7 +472,6 @@ log "locale       : ${LANG:-unset}"
 # quit within SRCDS_STOP_TIMEOUT seconds it is terminated the hard way.
 set_state running
 
-CONSOLE_FIFO="${STEAM_HOME}/.srcds-console.fifo"
 rm -f "$CONSOLE_FIFO"
 mkfifo "$CONSOLE_FIFO"
 # Opened read-write so that opening it never blocks and the child never sees EOF.
@@ -341,7 +490,7 @@ if command -v script >/dev/null 2>&1; then
     script -q -c "$SRCDS_CMD" /dev/null <"$CONSOLE_FIFO" &
 else
     # No pty available: the server still runs, but only a forced stop is possible.
-    log "WARNING: 'script' not found - graceful console quit is unavailable"
+    warn "'script' not found - graceful console quit is unavailable"
     sh -c "$SRCDS_CMD" <"$CONSOLE_FIFO" &
 fi
 srv_pid=$!
@@ -349,12 +498,12 @@ srv_pid=$!
 # Normal case: the server crashes or is stopped from the outside, so `wait`
 # simply returns its status. A stop signal is handled entirely inside the
 # shutdown trap above, which exits the script.
-rc=0
+_rc=0
 while : ; do
-    if wait "$srv_pid"; then rc=0; else rc=$?; fi
+    if wait "$srv_pid"; then _rc=0; else _rc=$?; fi
     kill -0 "$srv_pid" 2>/dev/null || break
 done
 
 rm -f "$CONSOLE_FIFO"
-log "server exited with code ${rc}"
-exit "$rc"
+log "server exited with code ${_rc}"
+exit "$_rc"
