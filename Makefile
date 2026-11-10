@@ -38,10 +38,10 @@ run:
 		-v hl2dm_data:/home/steam/hl2dm_server \
 		"$(IMAGE):$(TAG)"
 
+# The version is already part of the repository name
+# (hl2dm-server-2026-v1.0), so only the latest tag is published.
 push:
 	docker push "$(IMAGE):$(TAG)"
-	docker tag "$(IMAGE):$(TAG)" "$(IMAGE):$(VERSION)"
-	docker push "$(IMAGE):$(VERSION)"
 
 clean:
-	-docker rmi "$(IMAGE):$(TAG)" "$(IMAGE):$(VERSION)"
+	-docker rmi "$(IMAGE):$(TAG)"
